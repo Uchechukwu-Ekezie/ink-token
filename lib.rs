@@ -4,28 +4,25 @@
 mod token {
     use ink::storage::Mapping;
 
-    /// Custom error types for the token contract
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum Error {
-        /// Insufficient balance for the operation
         InsufficientBalance,
-        /// Unauthorized access - only owner can perform this operation
         Unauthorized,
-        /// Cannot transfer to the same account
         SelfTransfer,
+        InsufficientAllowance,
+        ContractPaused,
+        Blacklisted,
+        BatchLengthMismatch,
+        Overflow,
     }
 
-    /// Result type for contract operations
     pub type Result<T> = core::result::Result<T, Error>;
 
-    /// Events emitted by the token contract
     #[ink(event)]
     pub struct Mint {
-        /// Account that received the minted tokens
         #[ink(topic)]
         to: AccountId,
-        /// Amount of tokens minted
         amount: u128,
     }
 
@@ -33,26 +30,56 @@ mod token {
     pub struct Transfer {
         #[ink(topic)]
         from: AccountId,
-
         #[ink(topic)]
         to: AccountId,
-        /// Amount of tokens transferred
         amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct Burn {
+        #[ink(topic)]
+        from: AccountId,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct Approval {
+        #[ink(topic)]
+        owner: AccountId,
+        #[ink(topic)]
+        spender: AccountId,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct Paused {
+        is_paused: bool,
+    }
+
+    #[ink(event)]
+    pub struct BlacklistUpdated {
+        #[ink(topic)]
+        account: AccountId,
+        is_blacklisted: bool,
     }
 
     #[ink(storage)]
     pub struct Token {
-        /// Mapping from account to balance (like a phone book: person -> amount of money)
         balances: Mapping<AccountId, u128>,
-        /// The contract owner who can mint new tokens
         owner: AccountId,
-        /// Total supply of tokens
         total_supply: u128,
+        allowances: Mapping<(AccountId, AccountId), u128>,
+        paused: bool,
+        blacklist: Mapping<AccountId, bool>,
+    }
+
+    impl Default for Token {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl Token {
-        /// Constructor that creates a new token contract
-        /// The person who deploys the contract becomes the owner
         #[ink(constructor)]
         pub fn new() -> Self {
             let caller = Self::env().caller();
@@ -60,81 +87,249 @@ mod token {
                 balances: Mapping::default(),
                 owner: caller,
                 total_supply: 0,
+                allowances: Mapping::default(),
+                paused: false,
+                blacklist: Mapping::default(),
             }
         }
 
-        /// Mint new tokens (like printing new money)
-        /// Only the owner can call this function
         #[ink(message)]
         pub fn mint(&mut self, to: AccountId, amount: u128) -> Result<()> {
-            // Check if the caller is the owner
             if self.env().caller() != self.owner {
                 return Err(Error::Unauthorized);
             }
 
-            // Get the current balance of the account (default to 0 if not found)
-            let current_balance = self.balances.get(&to).unwrap_or(0);
+            let current_balance = self.balances.get(to).unwrap_or(0);
+            let new_balance = current_balance.checked_add(amount).ok_or(Error::Overflow)?;
+            self.balances.insert(to, &new_balance);
 
-            // Add the new tokens to their balance
-            let new_balance = current_balance + amount;
-            self.balances.insert(&to, &new_balance);
-
-            // Update total supply
-            self.total_supply += amount;
-
-            // Emit a Mint event (like sending a receipt)
+            self.total_supply = self.total_supply.checked_add(amount).ok_or(Error::Overflow)?;
             self.env().emit_event(Mint { to, amount });
 
             Ok(())
         }
 
-        /// Check how much money someone has (like checking your bank balance)
         #[ink(message)]
         pub fn balance_of(&self, account: AccountId) -> u128 {
-            self.balances.get(&account).unwrap_or(0)
+            self.balances.get(account).unwrap_or(0)
         }
 
-        /// Transfer tokens from one account to another (like sending money to someone)
         #[ink(message)]
         pub fn transfer(&mut self, to: AccountId, amount: u128) -> Result<()> {
             let from = self.env().caller();
 
-            // Prevent self-transfer
+            if self.paused {
+                return Err(Error::ContractPaused);
+            }
+
+            if self.blacklist.get(from).unwrap_or(false) || self.blacklist.get(to).unwrap_or(false) {
+                return Err(Error::Blacklisted);
+            }
+
             if from == to {
                 return Err(Error::SelfTransfer);
             }
 
-            // Get the sender's current balance
-            let from_balance = self.balances.get(&from).unwrap_or(0);
-
-            // Check if sender has enough tokens
+            let from_balance = self.balances.get(from).unwrap_or(0);
             if from_balance < amount {
                 return Err(Error::InsufficientBalance);
             }
 
-            // Get the receiver's current balance
-            let to_balance = self.balances.get(&to).unwrap_or(0);
+            let to_balance = self.balances.get(to).unwrap_or(0);
+            let new_from_balance = from_balance.checked_sub(amount).ok_or(Error::Overflow)?;
+            let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
+            self.balances.insert(from, &new_from_balance);
+            self.balances.insert(to, &new_to_balance);
 
-            // Update balances
-            self.balances.insert(&from, &(from_balance - amount));
-            self.balances.insert(&to, &(to_balance + amount));
-
-            // Emit a Transfer event (like sending a receipt)
             self.env().emit_event(Transfer { from, to, amount });
 
             Ok(())
         }
 
-        /// Get the contract owner
         #[ink(message)]
         pub fn owner(&self) -> AccountId {
             self.owner
         }
 
-        /// Get the total supply of tokens
         #[ink(message)]
         pub fn total_supply(&self) -> u128 {
             self.total_supply
         }
+
+        #[ink(message)]
+        pub fn burn(&mut self, amount: u128) -> Result<()> {
+            let from = self.env().caller();
+            let from_balance = self.balances.get(from).unwrap_or(0);
+
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+
+            let new_balance = from_balance.checked_sub(amount).ok_or(Error::Overflow)?;
+            self.balances.insert(from, &new_balance);
+            self.total_supply = self.total_supply.checked_sub(amount).ok_or(Error::Overflow)?;
+
+            self.env().emit_event(Burn { from, amount });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn approve(&mut self, spender: AccountId, amount: u128) -> Result<()> {
+            let owner = self.env().caller();
+            self.allowances.insert((owner, spender), &amount);
+            self.env().emit_event(Approval { owner, spender, amount });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn transfer_from(&mut self, from: AccountId, to: AccountId, amount: u128) -> Result<()> {
+            let spender = self.env().caller();
+
+            if self.paused {
+                return Err(Error::ContractPaused);
+            }
+
+            if self.blacklist.get(from).unwrap_or(false) || self.blacklist.get(to).unwrap_or(false) {
+                return Err(Error::Blacklisted);
+            }
+
+            if from == to {
+                return Err(Error::SelfTransfer);
+            }
+
+            let allowance = self.allowances.get((from, spender)).unwrap_or(0);
+            if allowance < amount {
+                return Err(Error::InsufficientAllowance);
+            }
+
+            let from_balance = self.balances.get(from).unwrap_or(0);
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+
+            let to_balance = self.balances.get(to).unwrap_or(0);
+            let new_from_balance = from_balance.checked_sub(amount).ok_or(Error::Overflow)?;
+            let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
+            self.balances.insert(from, &new_from_balance);
+            self.balances.insert(to, &new_to_balance);
+
+            let new_allowance = allowance.checked_sub(amount).ok_or(Error::Overflow)?;
+            self.allowances.insert((from, spender), &new_allowance);
+
+            self.env().emit_event(Transfer { from, to, amount });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn allowance(&self, owner: AccountId, spender: AccountId) -> u128 {
+            self.allowances.get((owner, spender)).unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn pause(&mut self) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::Unauthorized);
+            }
+
+            self.paused = true;
+            self.env().emit_event(Paused { is_paused: true });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn unpause(&mut self) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::Unauthorized);
+            }
+
+            self.paused = false;
+            self.env().emit_event(Paused { is_paused: false });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn is_paused(&self) -> bool {
+            self.paused
+        }
+
+        #[ink(message)]
+        pub fn blacklist_account(&mut self, account: AccountId) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::Unauthorized);
+            }
+
+            self.blacklist.insert(account, &true);
+            self.env().emit_event(BlacklistUpdated { account, is_blacklisted: true });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn remove_from_blacklist(&mut self, account: AccountId) -> Result<()> {
+            if self.env().caller() != self.owner {
+                return Err(Error::Unauthorized);
+            }
+
+            self.blacklist.insert(account, &false);
+            self.env().emit_event(BlacklistUpdated { account, is_blacklisted: false });
+
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn is_blacklisted(&self, account: AccountId) -> bool {
+            self.blacklist.get(account).unwrap_or(false)
+        }
+
+        #[ink(message)]
+        pub fn batch_transfer(&mut self, recipients: ink::prelude::vec::Vec<AccountId>, amounts: ink::prelude::vec::Vec<u128>) -> Result<()> {
+            if recipients.len() != amounts.len() {
+                return Err(Error::BatchLengthMismatch);
+            }
+
+            let from = self.env().caller();
+
+            if self.paused {
+                return Err(Error::ContractPaused);
+            }
+
+            if self.blacklist.get(from).unwrap_or(false) {
+                return Err(Error::Blacklisted);
+            }
+
+            let mut total_amount: u128 = 0;
+            for amount in &amounts {
+                total_amount = total_amount.checked_add(*amount).ok_or(Error::Overflow)?;
+            }
+
+            let from_balance = self.balances.get(from).unwrap_or(0);
+            if from_balance < total_amount {
+                return Err(Error::InsufficientBalance);
+            }
+
+            for (i, recipient) in recipients.iter().enumerate() {
+                let amount = amounts[i];
+
+                if self.blacklist.get(*recipient).unwrap_or(false) || from == *recipient {
+                    continue;
+                }
+
+                let to_balance = self.balances.get(*recipient).unwrap_or(0);
+                let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
+                self.balances.insert(*recipient, &new_to_balance);
+
+                self.env().emit_event(Transfer { from, to: *recipient, amount });
+            }
+
+            let new_from_balance = from_balance.checked_sub(total_amount).ok_or(Error::Overflow)?;
+            self.balances.insert(from, &new_from_balance);
+
+            Ok(())
+        }
     }
-}/// Unit tests for the token contract
+}
